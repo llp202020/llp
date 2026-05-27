@@ -11,8 +11,8 @@
 %   ovd_1_15000nm.mat  -> 9 sub-cells, canonical indices 10:18
 %
 % Methods:
-%   tomo / dhm / fpm stacks usually already contain the 18 sub-cells from
-%   the two ground-truth files, but they are still verified and reordered.
+%   tomo / dhm / fpm stacks can contain a larger pool, e.g. 45 sub-cells.
+%   The pipeline selects the 18 cells corresponding to the two GT OVD files.
 %   tie / dpc stacks contain 18 sub-cells whose import order can be wrong,
 %   so they are matched to the same canonical ground-truth order.
 %
@@ -44,6 +44,13 @@ cfg.output_dir = fullfile('.', 'Analysis_Results');
 % .mat file instead of as separate *_comparison_data.mat files.
 data_file = 'data-conference-paper.mat';
 cfg.conference_data_file = fullfile('.', data_file);
+
+% Defaults from Master_Data_Comparison_8778.m. Values in
+% data-conference-paper.mat override these when present.
+cfg.default_lambda_um = 0.532000000000000;
+cfg.default_dx_um = 0.65;
+cfg.default_polymerRI = 1.566760000000000;
+cfg.default_n_immersion = 1.518431000000000;
 
 % Strict comparison patch size.
 cfg.patch_size = [401, 401];
@@ -145,6 +152,7 @@ cfg.gt_15k_file = resolveGtPath(cfg.gt_15k_file);
 
 fprintf('================ Phase 1: Build canonical GT order ================\n');
 gt = buildCanonicalGroundTruth(cfg);
+gt.physical_params = loadGtPhysicalParams(cfg);
 save(fullfile(cfg.output_dir, 'canonical_gt_401x401x18.mat'), 'gt');
 fprintf('  -> Canonical GT saved: %s\n', fullfile(cfg.output_dir, 'canonical_gt_401x401x18.mat'));
 
@@ -177,12 +185,13 @@ for m = 1:numel(method_specs)
 
     fprintf('  -> %-10s loading: %s\n', upper(method_name), method_file);
     try
-        raw_stack = loadMethodStack(method_file, method_name);
+        [raw_stack, method_params] = loadMethodStack(method_file, method_name);
     catch ME
         fprintf('     skipped: %s\n', ME.message);
         continue;
     end
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
+    method_params = fillMissingMethodParams(method_params, gt.physical_params);
 
     [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, method_name);
     aligned.(method_name).ph_stack = ordered_stack;
@@ -191,6 +200,8 @@ for m = 1:numel(method_specs)
     aligned.(method_name).score_matrix = report.score_matrix;
     aligned.(method_name).pair_scores = report.pair_scores;
     aligned.(method_name).local_shifts = report.local_shifts;
+    aligned.(method_name).method_params = method_params;
+    aligned.(method_name).selected_source_frames = report.selected_source_frames;
 
     out_struct = aligned.(method_name); %#ok<NASGU>
     out_path = fullfile(cfg.output_dir, sprintf('%s_aligned_to_gt_401x401x18.mat', method_name));
@@ -200,8 +211,11 @@ for m = 1:numel(method_specs)
     fprintf('     saved: %s | median pair score %.4f\n', out_path, median(report.pair_scores));
 end
 
+ovd_report = computeOvdReport(aligned, method_specs, cfg);
 save(fullfile(cfg.output_dir, 'all_methods_aligned_to_gt_401x401x18.mat'), ...
-    'aligned', 'method_report', '-v7.3');
+    'aligned', 'method_report', 'ovd_report', '-v7.3');
+save(fullfile(cfg.output_dir, 'ovd_comparison_report.mat'), 'ovd_report');
+writeOvdCsv(ovd_report, fullfile(cfg.output_dir, 'ovd_comparison_report.csv'));
 
 %% -------------------- Visual verification --------------------------------
 fprintf('\n================ Phase 4: Verification gallery =====================\n');
@@ -269,6 +283,22 @@ function gt = buildCanonicalGroundTruth(cfg)
         gt.index_table(k).source_cell_index = gt.meta(k).source_cell_index; %#ok<AGROW>
         gt.index_table(k).centroid = gt.meta(k).centroid; %#ok<AGROW>
     end
+end
+
+function params = loadGtPhysicalParams(cfg)
+    params = struct();
+    params.lambda = cfg.default_lambda_um;
+    params.dx = cfg.default_dx_um;
+    params.polymerRI = cfg.default_polymerRI;
+    params.n_immersion = cfg.default_n_immersion;
+
+    if isfile(cfg.conference_data_file)
+        s = load(cfg.conference_data_file);
+        if isfield(s, 'model_synt')
+            params = mergeMethodParams(params, extractMethodParams(s.model_synt));
+        end
+    end
+    params.delta_n = params.polymerRI - params.n_immersion;
 end
 
 function height_map = loadHeightMap(mat_path)
@@ -671,19 +701,20 @@ function data = loadFirstNumericMatrix(mat_path)
     error('No numeric matrix found in %s', mat_path);
 end
 
-function stack = loadMethodStack(mat_path, method_name)
+function [stack, method_params] = loadMethodStack(mat_path, method_name)
     s = load(mat_path);
     aliases = methodAliases(method_name);
+    method_params = defaultMethodParams(method_name, mat_path);
 
     % Aggregate files can contain several methods. Prefer a stack whose
     % variable path explicitly names the requested method.
-    [stack, source_path] = findNamedStack(s, aliases, '');
+    [stack, source_path, method_params] = findNamedStack(s, aliases, '', method_params);
     if ~isempty(stack)
         fprintf('     method stack found at variable path: %s\n', source_path);
         return;
     end
 
-    if strcmp(fileNameOnly(mat_path), 'data-conference-paper.mat')
+    if strcmpi(fileNameOnly(mat_path), 'data-conference-paper.mat')
         error('Method "%s" was not found as a named field/path in %s.', method_name, mat_path);
     end
 
@@ -692,6 +723,8 @@ function stack = loadMethodStack(mat_path, method_name)
         if isfield(s, preferred{i})
             stack = unwrapStackVariable(s.(preferred{i}));
             if ~isempty(stack)
+                method_params = mergeMethodParams(method_params, extractMethodParams(s.(preferred{i})));
+                method_params.stack_path = preferred{i};
                 return;
             end
         end
@@ -701,11 +734,35 @@ function stack = loadMethodStack(mat_path, method_name)
     for i = 1:numel(names)
         stack = unwrapStackVariable(s.(names{i}));
         if ~isempty(stack)
+            method_params = mergeMethodParams(method_params, extractMethodParams(s.(names{i})));
+            method_params.stack_path = names{i};
             return;
         end
     end
 
     error('No usable 18-layer numeric stack found in %s', mat_path);
+end
+
+function params = defaultMethodParams(method_name, mat_path)
+    params = struct();
+    params.method = method_name;
+    params.source_file = mat_path;
+    params.stack_path = '';
+    params.lambda = NaN;
+    params.dx = NaN;
+    params.polymerRI = NaN;
+    params.n_immersion = NaN;
+    params.delta_n = NaN;
+end
+
+function params = fillMissingMethodParams(params, gt_params)
+    names = {'lambda', 'dx', 'polymerRI', 'n_immersion'};
+    for i = 1:numel(names)
+        if ~isfield(params, names{i}) || ~isfinite(params.(names{i}))
+            params.(names{i}) = gt_params.(names{i});
+        end
+    end
+    params.delta_n = params.polymerRI - params.n_immersion;
 end
 
 function name = fileNameOnly(path_name)
@@ -730,14 +787,17 @@ function aliases = methodAliases(method_name)
     end
 end
 
-function [stack, source_path] = findNamedStack(v, aliases, current_path)
+function [stack, source_path, method_params] = findNamedStack(v, aliases, current_path, inherited_params)
     stack = [];
     source_path = '';
+    method_params = inherited_params;
 
     if isNamedStackCandidate(v, aliases, current_path)
         stack = unwrapStackVariable(v);
         if ~isempty(stack)
             source_path = current_path;
+            method_params = mergeMethodParams(inherited_params, extractMethodParams(v));
+            method_params.stack_path = current_path;
             return;
         end
     end
@@ -755,7 +815,11 @@ function [stack, source_path] = findNamedStack(v, aliases, current_path)
                     continue;
                 end
 
-                [stack, source_path] = findNamedStack(v.(names{i}), aliases, field_path);
+                next_params = inherited_params;
+                if field_matches
+                    next_params = mergeMethodParams(inherited_params, extractMethodParams(v.(names{i})));
+                end
+                [stack, source_path, method_params] = findNamedStack(v.(names{i}), aliases, field_path, next_params);
                 if ~isempty(stack)
                     return;
                 end
@@ -764,7 +828,7 @@ function [stack, source_path] = findNamedStack(v, aliases, current_path)
     elseif iscell(v)
         for i = 1:numel(v)
             item_path = sprintf('%s{%d}', current_path, i);
-            [stack, source_path] = findNamedStack(v{i}, aliases, item_path);
+            [stack, source_path, method_params] = findNamedStack(v{i}, aliases, item_path, inherited_params);
             if ~isempty(stack)
                 return;
             end
@@ -774,14 +838,14 @@ end
 
 function tf = isNamedStackCandidate(v, aliases, current_path)
     tf = ~isempty(current_path) && nameMatchesMethod(current_path, aliases) && ...
-        ((isnumeric(v) && ndims(v) == 3 && any(size(v) == 18)) || isstruct(v) || iscell(v));
+        ((isnumeric(v) && ndims(v) == 3 && hasEnoughStackLayers(v)) || isstruct(v) || iscell(v));
 end
 
 function tf = nameMatchesMethod(name, aliases)
     normalized_name = normalizeName(name);
     tf = false;
     for i = 1:numel(aliases)
-        if contains(normalized_name, normalizeName(aliases{i}))
+        if ~isempty(strfind(normalized_name, normalizeName(aliases{i}))) %#ok<STREMP>
             tf = true;
             return;
         end
@@ -800,10 +864,58 @@ function out = appendPath(base_path, field_name)
     end
 end
 
+function params = extractMethodParams(v)
+    params = struct();
+    if ~isstruct(v)
+        return;
+    end
+
+    params.lambda = readNumericScalarField(v, {'lambda', 'lambda_um', 'wavelength'});
+    params.dx = readNumericScalarField(v, {'dx', 'pixel_size', 'pixelsize', 'sampling'});
+    params.polymerRI = readNumericScalarField(v, {'polymerRI', 'polymer_ri', 'n_polymer'});
+    params.n_immersion = readNumericScalarField(v, {'n_immersion', 'nImmersion', 'immersionRI', 'n_medium'});
+    if isfield(params, 'polymerRI') && isfield(params, 'n_immersion') && ...
+            isfinite(params.polymerRI) && isfinite(params.n_immersion)
+        params.delta_n = params.polymerRI - params.n_immersion;
+    end
+end
+
+function value = readNumericScalarField(s, names)
+    value = NaN;
+    for i = 1:numel(names)
+        if isfield(s, names{i})
+            candidate = s.(names{i});
+            if isnumeric(candidate) && ~isempty(candidate)
+                value = double(candidate(1));
+                return;
+            end
+        end
+    end
+end
+
+function out = mergeMethodParams(base_params, new_params)
+    out = base_params;
+    names = fieldnames(new_params);
+    for i = 1:numel(names)
+        value = new_params.(names{i});
+        if isnumeric(value)
+            if isscalar(value) && isfinite(value)
+                out.(names{i}) = value;
+            end
+        elseif ~isempty(value)
+            out.(names{i}) = value;
+        end
+    end
+    if isfield(out, 'polymerRI') && isfield(out, 'n_immersion') && ...
+            isfinite(out.polymerRI) && isfinite(out.n_immersion)
+        out.delta_n = out.polymerRI - out.n_immersion;
+    end
+end
+
 function stack = unwrapStackVariable(v)
     stack = [];
     if isnumeric(v) && ndims(v) == 3
-        if any(size(v) == 18)
+        if hasEnoughStackLayers(v)
             stack = double(v);
             stack = moveLayerDimToThird(stack);
         end
@@ -844,21 +956,38 @@ function stack = moveLayerDimToThird(stack)
     if numel(dims) ~= 3
         error('Stack must be 3-D.');
     end
-    if dims(3) == 18
+
+    layer_dim = findLayerDim(dims);
+    if layer_dim == 3
         return;
-    elseif dims(1) == 18
+    elseif layer_dim == 1
         stack = permute(stack, [2, 3, 1]);
-    elseif dims(2) == 18
+    elseif layer_dim == 2
         stack = permute(stack, [1, 3, 2]);
     else
-        error('Cannot find 18-layer dimension.');
+        error('Cannot find a valid cell-frame dimension with at least 18 layers.');
     end
+end
+
+function tf = hasEnoughStackLayers(stack)
+    dims = size(stack);
+    tf = numel(dims) == 3 && findLayerDim(dims) > 0;
+end
+
+function layer_dim = findLayerDim(dims)
+    candidates = find(dims >= 18 & dims <= 200);
+    if isempty(candidates)
+        layer_dim = 0;
+        return;
+    end
+    [~, best_idx] = min(dims(candidates));
+    layer_dim = candidates(best_idx);
 end
 
 function stack = standardizeStackSize(stack, patch_size)
     stack = moveLayerDimToThird(stack);
-    if size(stack, 3) ~= 18
-        error('Expected 18 sub-cell layers, got %d.', size(stack, 3));
+    if size(stack, 3) < 18
+        error('Expected at least 18 sub-cell layers, got %d.', size(stack, 3));
     end
 
     if size(stack, 1) == patch_size(1) && size(stack, 2) == patch_size(2)
@@ -875,14 +1004,14 @@ end
 function [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, method_name)
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
     score_matrix = computeScoreMatrix(raw_stack, gt, cfg);
-    assignment = exactMaxAssignment(score_matrix);
+    source_for_target = exactMaxAssignment(score_matrix);
 
     ordered_stack = zeros(size(gt.stack));
     local_shifts = zeros(18, 2);
     pair_scores = zeros(18, 1);
 
-    for src = 1:18
-        dst = assignment(src);
+    for dst = 1:18
+        src = source_for_target(dst);
         mask = gt.mask_stack(:, :, dst);
         [aligned_patch, shift_yx] = localRegisterPatch(raw_stack(:, :, src), gt.stack(:, :, dst), ...
             mask, cfg.assignment_margin);
@@ -893,32 +1022,36 @@ function [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, met
 
     report = struct();
     report.method = method_name;
-    report.assignment = [(1:18)', assignment(:)];
+    report.assignment = [source_for_target(:), (1:18)'];
     report.score_matrix = score_matrix;
     report.pair_scores = pair_scores;
     report.local_shifts = local_shifts;
+    report.selected_source_frames = source_for_target(:)';
 
     printAssignmentReport(method_name, report, gt);
 end
 
 function score_matrix = computeScoreMatrix(raw_stack, gt, cfg)
-    n = 18;
-    score_matrix = zeros(n, n);
+    n_source = size(raw_stack, 3);
+    n_target = size(gt.stack, 3);
+    score_matrix = zeros(n_source, n_target);
 
     source_desc = patchDescriptors(raw_stack);
     target_desc = patchDescriptors(gt.stack);
     amp_scale = safeMedianPositive(source_desc.amp) / max(safeMedianPositive(target_desc.amp), eps);
     area_scale = safeMedianPositive(source_desc.area) / max(safeMedianPositive(target_desc.area), eps);
 
-    source_feat = cell(n, 1);
-    target_feat = cell(n, 1);
-    for i = 1:n
+    source_feat = cell(n_source, 1);
+    target_feat = cell(n_target, 1);
+    for i = 1:n_source
         source_feat{i} = makeScoreFeature(raw_stack(:, :, i), cfg.score_size);
+    end
+    for i = 1:n_target
         target_feat{i} = makeScoreFeature(gt.stack(:, :, i), cfg.score_size);
     end
 
-    for src = 1:n
-        for dst = 1:n
+    for src = 1:n_source
+        for dst = 1:n_target
             ncc_score = localNccScore(source_feat{src}, target_feat{dst}, 8);
 
             predicted_amp = target_desc.amp(dst) * amp_scale;
@@ -975,61 +1108,95 @@ function score = localNccScore(source_feat, target_feat, margin)
 end
 
 function assignment = exactMaxAssignment(score_matrix)
-    % Dynamic programming exact assignment. n=18 -> about 4.7M transitions.
-    [n_rows, n_cols] = size(score_matrix);
-    if n_rows ~= n_cols
-        error('Assignment matrix must be square.');
-    end
-    n = n_rows;
-    if n > 22
-        error('Exact DP assignment is intended for <=22 items; got %d.', n);
+    % Rectangular exact assignment. Rows are source frames; columns are the
+    % 18 canonical GT cells. Source frames may be skipped, so a 45-frame
+    % TOMO/DHM/FPM stack is reduced to the best 18 one-to-one matches.
+    [n_source, n_target] = size(score_matrix);
+    if n_source < n_target
+        error('Need at least %d source frames, got %d.', n_target, n_source);
     end
 
-    num_states = 2^n;
+    if exist('matchpairs', 'file') == 2
+        try
+            pairs = matchpairs(-score_matrix, 1e6);
+            if size(pairs, 1) >= n_target && numel(unique(pairs(:, 2))) == n_target
+                assignment = zeros(n_target, 1);
+                for i = 1:size(pairs, 1)
+                    assignment(pairs(i, 2)) = pairs(i, 1);
+                end
+                if all(assignment > 0)
+                    return;
+                end
+            end
+        catch
+            % Fall back to the DP implementation below.
+        end
+    end
+
+    if n_target > 22
+        error('Exact DP assignment is intended for <=22 target cells; got %d.', n_target);
+    end
+
+    num_states = 2^n_target;
     dp = -inf(num_states, 1);
-    parent_col = zeros(num_states, 1, 'uint16');
-    parent_state = zeros(num_states, 1, 'uint32');
+    parent_col = zeros(num_states, n_source, 'uint16');
+    parent_state = zeros(num_states, n_source, 'uint32');
     dp(1) = 0;
 
-    for mask_value = 0:(num_states - 1)
-        mask = uint32(mask_value);
-        state_idx = mask_value + 1;
-        if ~isfinite(dp(state_idx))
-            continue;
-        end
-        row = bitCount(mask) + 1;
-        if row > n
-            continue;
-        end
-        for col = 1:n
-            if ~bitget(mask, col)
-                new_mask = bitset(mask, col);
-                new_idx = double(new_mask) + 1;
-                candidate = dp(state_idx) + score_matrix(row, col);
-                if candidate > dp(new_idx)
-                    dp(new_idx) = candidate;
-                    parent_col(new_idx) = uint16(col);
-                    parent_state(new_idx) = mask;
+    for src = 1:n_source
+        next_dp = -inf(num_states, 1);
+        for mask_value = 0:(num_states - 1)
+            mask = uint32(mask_value);
+            state_idx = mask_value + 1;
+            if ~isfinite(dp(state_idx))
+                continue;
+            end
+
+            % Skip this source frame.
+            if dp(state_idx) > next_dp(state_idx)
+                next_dp(state_idx) = dp(state_idx);
+                parent_col(state_idx, src) = uint16(0);
+                parent_state(state_idx, src) = mask;
+            end
+
+            % Assign this source frame to one still-unmatched GT cell.
+            for col = 1:n_target
+                if ~bitget(mask, col)
+                    new_mask = bitset(mask, col);
+                    new_idx = double(new_mask) + 1;
+                    candidate = dp(state_idx) + score_matrix(src, col);
+                    if candidate > next_dp(new_idx)
+                        next_dp(new_idx) = candidate;
+                        parent_col(new_idx, src) = uint16(col);
+                        parent_state(new_idx, src) = mask;
+                    end
                 end
             end
         end
+        dp = next_dp;
     end
 
-    assignment = zeros(n, 1);
+    assignment = zeros(n_target, 1);
     mask = uint32(num_states - 1);
-    for row = n:-1:1
-        idx = double(mask) + 1;
-        col = double(parent_col(idx));
-        assignment(row) = col;
-        mask = parent_state(idx);
+    if ~isfinite(dp(double(mask) + 1))
+        error('Unable to assign all target cells.');
     end
-end
 
-function c = bitCount(mask)
-    c = 0;
-    while mask > 0
-        c = c + double(bitand(mask, uint32(1)));
-        mask = bitshift(mask, -1);
+    for src = n_source:-1:1
+        idx = double(mask) + 1;
+        col = double(parent_col(idx, src));
+        prev_mask = parent_state(idx, src);
+        if col > 0
+            assignment(col) = src;
+        end
+        mask = prev_mask;
+        if mask == 0 && all(assignment > 0)
+            break;
+        end
+    end
+
+    if any(assignment == 0)
+        error('Assignment reconstruction failed.');
     end
 end
 
@@ -1124,11 +1291,85 @@ end
 
 function printAssignmentReport(method_name, report, gt)
     fprintf('     assignment for %s (source -> canonical GT):\n', upper(method_name));
-    for src = 1:size(report.assignment, 1)
-        dst = report.assignment(src, 2);
+    for row = 1:size(report.assignment, 1)
+        src = report.assignment(row, 1);
+        dst = report.assignment(row, 2);
         fprintf('       src %02d -> gt %02d (%s), score %.4f\n', ...
             src, dst, gt.label{dst}, report.score_matrix(src, dst));
     end
+end
+
+function ovd_report = computeOvdReport(aligned, method_specs, cfg)
+    gt = aligned.gt;
+    gt_params = gt.physical_params;
+    aligned_dx_um = gt_params.dx;
+    pixel_area_um2 = aligned_dx_um^2;
+    n_cells = size(gt.stack, 3);
+
+    gt_ovd = zeros(n_cells, 1);
+    gt_volume = zeros(n_cells, 1);
+    for c = 1:n_cells
+        mask = gt.mask_stack(:, :, c);
+        gt_ovd(c) = phaseToOvd(gt.stack(:, :, c), mask, gt_params.lambda, pixel_area_um2);
+        gt_volume(c) = gt_ovd(c) / gt_params.delta_n;
+    end
+
+    ovd_report = struct([]);
+    row = 0;
+    for m = 1:numel(method_specs)
+        method_name = method_specs(m).name;
+        if ~isfield(aligned, method_name)
+            continue;
+        end
+
+        params = aligned.(method_name).method_params;
+        for c = 1:n_cells
+            row = row + 1;
+            mask = gt.mask_stack(:, :, c);
+            method_ovd = phaseToOvd(aligned.(method_name).ph_stack(:, :, c), ...
+                mask, params.lambda, pixel_area_um2);
+            method_volume = method_ovd / params.delta_n;
+
+            ovd_report(row).method = method_name; %#ok<AGROW>
+            ovd_report(row).cell_index = c; %#ok<AGROW>
+            ovd_report(row).ovd_group = gt.label{c}; %#ok<AGROW>
+            ovd_report(row).source_frame = aligned.(method_name).selected_source_frames(c); %#ok<AGROW>
+            ovd_report(row).lambda_um = params.lambda; %#ok<AGROW>
+            ovd_report(row).native_dx_um = params.dx; %#ok<AGROW>
+            ovd_report(row).aligned_dx_um = aligned_dx_um; %#ok<AGROW>
+            ovd_report(row).polymerRI = params.polymerRI; %#ok<AGROW>
+            ovd_report(row).n_immersion = params.n_immersion; %#ok<AGROW>
+            ovd_report(row).delta_n = params.delta_n; %#ok<AGROW>
+            ovd_report(row).gt_ovd_um3 = gt_ovd(c); %#ok<AGROW>
+            ovd_report(row).method_ovd_um3 = method_ovd; %#ok<AGROW>
+            ovd_report(row).ovd_relative_error = safeRelativeError(method_ovd, gt_ovd(c)); %#ok<AGROW>
+            ovd_report(row).gt_volume_um3 = gt_volume(c); %#ok<AGROW>
+            ovd_report(row).method_volume_um3 = method_volume; %#ok<AGROW>
+            ovd_report(row).volume_relative_error = safeRelativeError(method_volume, gt_volume(c)); %#ok<AGROW>
+        end
+    end
+end
+
+function rel = safeRelativeError(value, reference)
+    if ~isfinite(reference) || abs(reference) < eps
+        rel = NaN;
+    else
+        rel = (value - reference) / reference;
+    end
+end
+
+function ovd = phaseToOvd(phase_img, mask, lambda_um, pixel_area_um2)
+    values = double(phase_img(mask));
+    values = values(isfinite(values));
+    ovd = sum(values) * (lambda_um / (2 * pi)) * pixel_area_um2;
+end
+
+function writeOvdCsv(ovd_report, out_path)
+    if isempty(ovd_report)
+        return;
+    end
+    T = struct2table(ovd_report);
+    writetable(T, out_path);
 end
 
 function makeVerificationGallery(aligned, method_specs, cfg)
