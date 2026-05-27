@@ -64,6 +64,7 @@ cfg.keep_only_gt_mask = false;     % Preserve measured cell support; OVD uses an
 cfg.output_mask_dilate_px = 8;     % Used only if keep_only_gt_mask is set to true.
 cfg.ovd_mask_dilate_px = 8;        % Prevent strict GT masks from clipping method cells.
 cfg.background_percentile = 5;     % Robust background subtraction percentile.
+cfg.structured_group_size = 9;     % 45-frame conference stacks are 5 groups x 9 shapes.
 
 % DPC raw phase-map extraction. If raw maps are available, this produces a
 % fresh DPC stack; otherwise the script falls back to an existing DPC stack.
@@ -338,8 +339,11 @@ function source_map = loadConferenceTruthSourceMap(cfg, gt)
         end
         model_stack = standardizeStackSize(model_stack, cfg.patch_size);
         source_patches = buildCandidatePatchStack(model_stack, cfg);
-        score_matrix = computeScoreMatrix(source_patches, gt, cfg);
-        source_map = exactMaxAssignment(score_matrix);
+        source_map = structuredGroupSourceMap(source_patches, gt, cfg);
+        if isempty(source_map)
+            score_matrix = computeScoreMatrix(source_patches, gt, cfg);
+            source_map = exactMaxAssignment(score_matrix);
+        end
     catch ME
         fprintf('  -> model_synt source map skipped: %s\n', ME.message);
         source_map = [];
@@ -354,6 +358,82 @@ function tf = usesSharedSourceMap(method_name)
     lower_name = lower(method_name);
     tf = strcmp(lower_name, 'tomo') || ~isempty(strfind(lower_name, 'dhm')) || ...
         ~isempty(strfind(lower_name, 'fpm'));
+end
+
+function source_map = structuredGroupSourceMap(source_stack, gt, cfg)
+    source_map = [];
+    group_size = cfg.structured_group_size;
+    n_source = size(source_stack, 3);
+    if n_source < 2 * group_size || mod(n_source, group_size) ~= 0 || size(gt.stack, 3) ~= 18
+        return;
+    end
+
+    n_groups = n_source / group_size;
+    gt_blocks = {1:9, 10:18};
+    group_block = repmat(struct('frames', [], 'score', [], 'amp_ratio', [], 'amp_score', []), n_groups, 2);
+
+    source_desc = patchDescriptors(source_stack);
+    gt_desc = patchDescriptors(gt.stack);
+
+    for g = 1:n_groups
+        frame_idx = (g - 1) * group_size + (1:group_size);
+        group_stack = source_stack(:, :, frame_idx);
+        for b = 1:2
+            gt_idx = gt_blocks{b};
+            sub_gt = gt;
+            sub_gt.stack = gt.stack(:, :, gt_idx);
+            sub_gt.mask_stack = gt.mask_stack(:, :, gt_idx);
+
+            score = computeScoreMatrix(group_stack, sub_gt, cfg);
+            local_source_for_target = exactMaxAssignment(score);
+            mapped_frames = frame_idx(local_source_for_target);
+
+            ratios = source_desc.amp(mapped_frames) ./ max(gt_desc.amp(gt_idx), eps);
+            ratios = ratios(isfinite(ratios) & ratios > 0);
+            if isempty(ratios)
+                amp_ratio = NaN;
+                amp_score = 0;
+            else
+                amp_ratio = median(ratios);
+                amp_score = exp(-abs(log(amp_ratio)) / 0.25);
+            end
+
+            group_block(g, b).frames = mapped_frames;
+            group_block(g, b).score = median(diag(score(local_source_for_target, 1:numel(gt_idx))));
+            group_block(g, b).amp_ratio = amp_ratio;
+            group_block(g, b).amp_score = amp_score;
+        end
+    end
+
+    best_score = -inf;
+    best_g6 = 0;
+    best_g15 = 0;
+    for g6 = 1:n_groups
+        for g15 = 1:n_groups
+            if g15 == g6
+                continue;
+            end
+            ratio6 = group_block(g6, 1).amp_ratio;
+            ratio15 = group_block(g15, 2).amp_ratio;
+            amp_order_bonus = 0;
+            if isfinite(ratio6) && isfinite(ratio15) && ratio15 >= ratio6
+                amp_order_bonus = 0.15;
+            end
+            score = group_block(g6, 1).score + group_block(g15, 2).score + ...
+                0.75 * group_block(g6, 1).amp_score + 0.75 * group_block(g15, 2).amp_score + ...
+                amp_order_bonus;
+            if score > best_score
+                best_score = score;
+                best_g6 = g6;
+                best_g15 = g15;
+            end
+        end
+    end
+
+    if best_g6 > 0 && best_g15 > 0
+        source_map = [group_block(best_g6, 1).frames(:); group_block(best_g15, 2).frames(:)]';
+        fprintf('  -> Structured 45-frame map: 6k group %d, 15k group %d.\n', best_g6, best_g15);
+    end
 end
 
 function height_map = loadHeightMap(mat_path)
@@ -1070,10 +1150,16 @@ function [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, met
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
     source_patches = buildCandidatePatchStack(raw_stack, cfg);
     score_matrix = computeScoreMatrix(source_patches, gt, cfg);
-    source_for_target = exactMaxAssignment(score_matrix);
+    source_for_target = [];
+    if usesSharedSourceMap(method_name)
+        source_for_target = structuredGroupSourceMap(source_patches, gt, cfg);
+    end
+    if isempty(source_for_target)
+        source_for_target = exactMaxAssignment(score_matrix);
+    end
 
     [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames( ...
-        source_patches, source_for_target, score_matrix, gt, cfg);
+        raw_stack, source_for_target, score_matrix, gt, cfg);
 
     report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts);
     printAssignmentReport(method_name, report, gt);
@@ -1082,21 +1168,21 @@ end
 function [ordered_stack, report] = alignStackWithSourceMap(raw_stack, gt, cfg, method_name, source_for_target)
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
     source_patches = buildCandidatePatchStack(raw_stack, cfg);
-    if max(source_for_target) > size(source_patches, 3)
+    if max(source_for_target) > size(raw_stack, 3)
         error('Shared source map references frame %d, but %s has only %d frames.', ...
-            max(source_for_target), method_name, size(source_patches, 3));
+            max(source_for_target), method_name, size(raw_stack, 3));
     end
 
     score_matrix = computeScoreMatrix(source_patches, gt, cfg);
     [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames( ...
-        source_patches, source_for_target, score_matrix, gt, cfg);
+        raw_stack, source_for_target, score_matrix, gt, cfg);
 
     report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts);
     report.used_shared_source_map = true;
     printAssignmentReport(method_name, report, gt);
 end
 
-function [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames(source_patches, source_for_target, score_matrix, gt, cfg)
+function [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames(raw_stack, source_for_target, score_matrix, gt, cfg)
     n_target = size(gt.stack, 3);
     ordered_stack = zeros(size(gt.stack));
     local_shifts = zeros(n_target, 2);
@@ -1105,7 +1191,8 @@ function [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames(
     for dst = 1:n_target
         src = source_for_target(dst);
         mask = expandedMask(gt.mask_stack(:, :, dst), cfg.output_mask_dilate_px);
-        [aligned_patch, shift_yx] = localRegisterPatch(source_patches(:, :, src), gt.stack(:, :, dst), ...
+        source_patch = extractTargetedCandidatePatch(raw_stack(:, :, src), gt.stack(:, :, dst), cfg);
+        [aligned_patch, shift_yx] = localRegisterPatch(source_patch, gt.stack(:, :, dst), ...
             mask, cfg.assignment_margin);
         ordered_stack(:, :, dst) = cleanWithMask(aligned_patch, mask, cfg);
         local_shifts(dst, :) = shift_yx;
@@ -1148,6 +1235,38 @@ function patch = extractCandidatePatch(img, patch_size)
 
     [cy, cx] = estimateCellCenter(img);
     patch = cropCenteredWithPadding(img, cy, cx, H, W, median(img(:)));
+end
+
+function patch = extractTargetedCandidatePatch(img, target_patch, cfg)
+    H = cfg.patch_size(1);
+    W = cfg.patch_size(2);
+    img = double(img);
+    img(~isfinite(img)) = 0;
+
+    if size(img, 1) == H && size(img, 2) == W
+        patch = img;
+        return;
+    end
+
+    if size(img, 1) < H || size(img, 2) < W
+        patch = extractCandidatePatch(img, cfg.patch_size);
+        return;
+    end
+
+    template = double(target_patch);
+    template(~expandedMask(template > cfg.gt_threshold, cfg.output_mask_dilate_px)) = 0;
+    template = normalizeForNcc(template);
+    search = normalizeForNcc(img);
+
+    c = normxcorr2(template, search);
+    [~, imax] = max(c(:));
+    [ypeak, xpeak] = ind2sub(size(c), imax);
+    top = ypeak - H + 1;
+    left = xpeak - W + 1;
+
+    top = max(1, min(size(img, 1) - H + 1, top));
+    left = max(1, min(size(img, 2) - W + 1, left));
+    patch = img(top:top + H - 1, left:left + W - 1);
 end
 
 function [cy, cx] = estimateCellCenter(img)
