@@ -363,10 +363,7 @@ function stack = extractDpcStackFromRaw(cfg, gt)
         dpc_stack(:, :, target_indices) = group_stack;
     end
 
-    dpc_stack = matchAndRegisterStack(dpc_stack, gt, cfg, 'dpc_raw_verified');
-    if isstruct(dpc_stack)
-        dpc_stack = dpc_stack.stack;
-    end
+    [dpc_stack, ~] = matchAndRegisterStack(dpc_stack, gt, cfg, 'dpc_raw_verified');
 end
 
 function cache = loadDpcCache(cfg)
