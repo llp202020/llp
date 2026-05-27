@@ -65,6 +65,9 @@ cfg.output_mask_dilate_px = 8;     % Used only if keep_only_gt_mask is set to tr
 cfg.ovd_mask_dilate_px = 0;        % OVD is integrated only over the cell itself.
 cfg.background_percentile = 5;     % Robust background subtraction percentile.
 cfg.structured_group_size = 9;     % 45-frame conference stacks are 5 groups x 9 shapes.
+cfg.tomo_angles = [0, 90, 180, 270];
+cfg.tomo_roi_margin = 10;
+cfg.background_fit_radius_um = 3;
 
 % TOMO-confirmed correspondence for the two OVD groups. Once TOMO has found
 % these indices, DHM/FPM/FHPM must use the exact same source frames.
@@ -1185,19 +1188,102 @@ end
 
 function [ordered_stack, report] = alignTomoStackWithSourceMap(raw_stack, gt, cfg, method_name, source_for_target)
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
-    source_patches = buildCandidatePatchStack(raw_stack, cfg);
     if max(source_for_target) > size(raw_stack, 3)
         error('Shared source map references frame %d, but %s has only %d frames.', ...
             max(source_for_target), method_name, size(raw_stack, 3));
     end
 
+    source_patches = buildCandidatePatchStack(raw_stack, cfg);
     score_matrix = computeScoreMatrix(source_patches, gt, cfg);
-    [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames( ...
-        raw_stack, source_for_target, score_matrix, gt, cfg);
+    n_target = size(gt.stack, 3);
+    ordered_stack = zeros(size(gt.stack));
+    local_shifts = zeros(n_target, 2);
+    pair_scores = zeros(n_target, 1);
+
+    for dst = 1:n_target
+        src = source_for_target(dst);
+        [aligned, shift_yx, tomo_score] = alignTomoFrameToGt( ...
+            raw_stack(:, :, src), gt.stack(:, :, dst), gt.mask_stack(:, :, dst), cfg);
+        ordered_stack(:, :, dst) = aligned;
+        local_shifts(dst, :) = shift_yx;
+        pair_scores(dst) = tomo_score;
+        score_matrix(src, dst) = tomo_score;
+    end
 
     report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts);
     report.used_shared_source_map = true;
     printAssignmentReport(method_name, report, gt);
+end
+
+function [aligned, shift_yx, best_score] = alignTomoFrameToGt(source_img, target_img, target_mask, cfg)
+    source_img = double(source_img);
+    target_img = double(target_img);
+    target_mask = logical(target_mask);
+    [H_sub, W_sub] = size(target_img);
+
+    [r_idx, c_idx] = find(target_mask);
+    if isempty(r_idx)
+        aligned = extractDirectCorrespondingPatch(source_img, cfg.patch_size);
+        shift_yx = [0, 0];
+        best_score = -inf;
+        return;
+    end
+
+    roi_r = max(1, min(r_idx) - cfg.tomo_roi_margin):min(H_sub, max(r_idx) + cfg.tomo_roi_margin);
+    roi_c = max(1, min(c_idx) - cfg.tomo_roi_margin):min(W_sub, max(c_idx) + cfg.tomo_roi_margin);
+    target_roi = target_img(roi_r, roi_c);
+    t_roi_grad = single(gradientMagnitude(smoothForGradient(target_roi)));
+
+    best_score = -inf;
+    best_img = source_img;
+    best_dy = 0;
+    best_dx = 0;
+
+    for flipid = 1:2
+        if flipid == 2
+            tmp = fliplr(source_img);
+        else
+            tmp = source_img;
+        end
+
+        for aid = 1:numel(cfg.tomo_angles)
+            test_img = imrotate(tmp, cfg.tomo_angles(aid), 'bilinear', 'crop');
+            test_grad = single(gradientMagnitude(smoothForGradient(test_img)));
+            if max(test_grad(:)) == 0
+                continue;
+            end
+
+            ph = max(0, size(t_roi_grad, 1) - size(test_grad, 1));
+            pw = max(0, size(t_roi_grad, 2) - size(test_grad, 2));
+            if ph > 0 || pw > 0
+                test_grad_match = padarray(test_grad, [ph, pw], 'replicate', 'post');
+            else
+                test_grad_match = test_grad;
+            end
+
+            cc = normxcorr2(t_roi_grad, test_grad_match);
+            [c_score, imax] = max(cc(:));
+            if c_score > best_score
+                best_score = double(c_score);
+                best_img = test_img;
+                [ypeak, xpeak] = ind2sub(size(cc), imax);
+                best_dy = (ypeak - size(t_roi_grad, 1)) + 1 - min(roi_r);
+                best_dx = (xpeak - size(t_roi_grad, 2)) + 1 - min(roi_c);
+            end
+        end
+    end
+
+    bg_val = double(median(best_img(:)));
+    aligned = bg_val * ones(H_sub, W_sub);
+    y_gt_vec = (1:H_sub)';
+    x_gt_vec = 1:W_sub;
+    y_test_vec = y_gt_vec + best_dy;
+    x_test_vec = x_gt_vec + best_dx;
+
+    valid_y = find(y_test_vec >= 1 & y_test_vec <= size(best_img, 1));
+    valid_x = find(x_test_vec >= 1 & x_test_vec <= size(best_img, 2));
+    aligned(valid_y, valid_x) = best_img(y_test_vec(valid_y), x_test_vec(valid_x));
+    shift_yx = [best_dy, best_dx];
 end
 
 function [ordered_stack, report] = directStackWithSourceMap(raw_stack, gt, cfg, method_name, source_for_target)
@@ -1455,6 +1541,24 @@ function mask = adaptiveCellMask(patch)
     end
 end
 
+function out = smoothForGradient(img)
+    if exist('imgaussfilt', 'file') == 2
+        out = imgaussfilt(img, 1);
+    else
+        kernel = [1 2 1; 2 4 2; 1 2 1] / 16;
+        out = conv2(double(img), kernel, 'same');
+    end
+end
+
+function grad = gradientMagnitude(img)
+    if exist('imgradient', 'file') == 2
+        grad = imgradient(img);
+    else
+        [gy, gx] = gradient(double(img));
+        grad = hypot(gx, gy);
+    end
+end
+
 function score = localNccScore(source_feat, target_feat, margin)
     search = padarray(source_feat, [margin, margin], 0, 'both');
     c = normxcorr2(target_feat, search);
@@ -1681,7 +1785,8 @@ function ovd_report = computeOvdReport(aligned, method_specs, cfg)
     gt_volume = zeros(n_cells, 1);
     for c = 1:n_cells
         mask = gt.mask_stack(:, :, c);
-        gt_ovd(c) = phaseToOvd(gt.stack(:, :, c), mask, gt_params.lambda, pixel_area_um2);
+        gt_img = subtractLocalBackgroundPlane(gt.stack(:, :, c), mask, gt_params.dx, cfg);
+        gt_ovd(c) = phaseToOvd(gt_img, mask, gt_params.lambda, pixel_area_um2);
         gt_volume(c) = gt_ovd(c) / gt_params.delta_n;
     end
 
@@ -1697,8 +1802,9 @@ function ovd_report = computeOvdReport(aligned, method_specs, cfg)
         for c = 1:n_cells
             row = row + 1;
             mask = gt.mask_stack(:, :, c);
-            method_ovd = phaseToOvd(aligned.(method_name).ph_stack(:, :, c), ...
-                mask, params.lambda, pixel_area_um2);
+            method_img = subtractLocalBackgroundPlane(aligned.(method_name).ph_stack(:, :, c), ...
+                mask, aligned_dx_um, cfg);
+            method_ovd = phaseToOvd(method_img, mask, params.lambda, pixel_area_um2);
             method_volume = method_ovd / params.delta_n;
 
             ovd_report(row).method = method_name; %#ok<AGROW>
@@ -1719,6 +1825,28 @@ function ovd_report = computeOvdReport(aligned, method_specs, cfg)
             ovd_report(row).volume_relative_error = safeRelativeError(method_volume, gt_volume(c)); %#ok<AGROW>
         end
     end
+end
+
+function corrected = subtractLocalBackgroundPlane(img, mask, dx_um, cfg)
+    corrected = double(img);
+    mask = logical(mask);
+    if ~any(mask(:)) || ~isfinite(dx_um) || dx_um <= 0
+        return;
+    end
+
+    rad_px = max(1, round(cfg.background_fit_radius_um / dx_um));
+    inner = expandedMask(mask, rad_px);
+    outer = expandedMask(mask, rad_px * 2);
+    mask_bgr = outer & ~inner;
+    if sum(mask_bgr(:)) <= 5
+        return;
+    end
+
+    [R_grid, C_grid] = ndgrid(1:size(img, 1), 1:size(img, 2));
+    A = [R_grid(mask_bgr), C_grid(mask_bgr), ones(sum(mask_bgr(:)), 1)];
+    coeffs = A \ corrected(mask_bgr);
+    plane = coeffs(1) * R_grid + coeffs(2) * C_grid + coeffs(3);
+    corrected = corrected - plane;
 end
 
 function rel = safeRelativeError(value, reference)
