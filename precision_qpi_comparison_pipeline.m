@@ -40,6 +40,11 @@ cfg.gt_15k_file = 'ovd_1_15000nm.mat';
 % Output folder.
 cfg.output_dir = fullfile('.', 'Analysis_Results');
 
+% Aggregate conference data file. TOMO/DHM/FPM can be stored inside this one
+% .mat file instead of as separate *_comparison_data.mat files.
+data_file = 'data-conference-paper.mat';
+cfg.conference_data_file = fullfile('.', data_file);
+
 % Strict comparison patch size.
 cfg.patch_size = [401, 401];
 
@@ -70,29 +75,64 @@ cfg.FLIP_RAW_DATA = true;
 cfg.ROTATE_RAW_90 = true;
 cfg.initial_angle_guess = 1.5;
 
-% Candidate files for method stacks. The loader reads common variable names
-% such as ph_stack/stack/data, or the first numeric 3-D variable it finds.
+% Candidate files for method stacks. The conference data file follows the
+% convention used in Master_Data_Comparison_8778.m:
+%   loaded_data.<method>.ph_stack or loaded_data.<method>.stack
+% with method names such as tomo, dhmnjust, dhmwut, fpmnjust, fpmqcilab...
+% If a file contains several methods, the loader first searches recursively
+% for variables/fields matching the requested method name, then falls back
+% to common stack variable names.
 method_specs = [
     struct('name', 'tomo', 'candidate_files', {{ ...
         fullfile(cfg.output_dir, 'tomo_comparison_data.mat'), ...
         fullfile('.', 'tomo_comparison_data.mat'), ...
-        fullfile('.', 'tomo.mat')}})
-    struct('name', 'dhm', 'candidate_files', {{ ...
-        fullfile(cfg.output_dir, 'dhm_comparison_data.mat'), ...
-        fullfile('.', 'dhm_comparison_data.mat'), ...
-        fullfile('.', 'dhm.mat')}})
-    struct('name', 'fpm', 'candidate_files', {{ ...
-        fullfile(cfg.output_dir, 'fpm_comparison_data.mat'), ...
-        fullfile('.', 'fpm_comparison_data.mat'), ...
-        fullfile('.', 'fpm.mat')}})
+        fullfile('.', 'tomo.mat'), ...
+        cfg.conference_data_file}})
+    struct('name', 'dhmnjust', 'candidate_files', {{ ...
+        fullfile(cfg.output_dir, 'dhmnjust_comparison_data.mat'), ...
+        fullfile('.', 'dhmnjust_comparison_data.mat'), ...
+        fullfile('.', 'dhmnjust.mat'), ...
+        cfg.conference_data_file}})
+    struct('name', 'dhmwut', 'candidate_files', {{ ...
+        fullfile(cfg.output_dir, 'dhmwut_comparison_data.mat'), ...
+        fullfile('.', 'dhmwut_comparison_data.mat'), ...
+        fullfile('.', 'dhmwut.mat'), ...
+        cfg.conference_data_file}})
+    struct('name', 'fhpmnjust', 'candidate_files', {{ ...
+        fullfile(cfg.output_dir, 'fhpmnjust_comparison_data.mat'), ...
+        fullfile('.', 'fhpmnjust_comparison_data.mat'), ...
+        fullfile('.', 'fhpmnjust.mat'), ...
+        cfg.conference_data_file}})
+    struct('name', 'fhpmwut', 'candidate_files', {{ ...
+        fullfile(cfg.output_dir, 'fhpmwut_comparison_data.mat'), ...
+        fullfile('.', 'fhpmwut_comparison_data.mat'), ...
+        fullfile('.', 'fhpmwut.mat'), ...
+        cfg.conference_data_file}})
+    struct('name', 'fpmnjust', 'candidate_files', {{ ...
+        fullfile(cfg.output_dir, 'fpmnjust_comparison_data.mat'), ...
+        fullfile('.', 'fpmnjust_comparison_data.mat'), ...
+        fullfile('.', 'fpmnjust.mat'), ...
+        cfg.conference_data_file}})
+    struct('name', 'fpmqcilab', 'candidate_files', {{ ...
+        fullfile(cfg.output_dir, 'fpmqcilab_comparison_data.mat'), ...
+        fullfile('.', 'fpmqcilab_comparison_data.mat'), ...
+        fullfile('.', 'fpmqcilab.mat'), ...
+        cfg.conference_data_file}})
+    struct('name', 'fpmwut', 'candidate_files', {{ ...
+        fullfile(cfg.output_dir, 'fpmwut_comparison_data.mat'), ...
+        fullfile('.', 'fpmwut_comparison_data.mat'), ...
+        fullfile('.', 'fpmwut.mat'), ...
+        cfg.conference_data_file}})
     struct('name', 'tie', 'candidate_files', {{ ...
         fullfile(cfg.output_dir, 'tie_comparison_data.mat'), ...
         fullfile('.', 'tie_comparison_data.mat'), ...
-        fullfile('.', 'tie.mat')}})
+        fullfile('.', 'tie.mat'), ...
+        cfg.conference_data_file}})
     struct('name', 'dpc', 'candidate_files', {{ ...
         fullfile(cfg.output_dir, 'dpc_comparison_data.mat'), ...
         fullfile('.', 'dpc_comparison_data.mat'), ...
-        fullfile('.', 'dpc.mat')}})
+        fullfile('.', 'dpc.mat'), ...
+        cfg.conference_data_file}})
 ];
 
 %% -------------------- Resolve inputs ------------------------------------
@@ -131,12 +171,17 @@ for m = 1:numel(method_specs)
     method_name = method_specs(m).name;
     [method_file, found] = firstExistingFile(method_specs(m).candidate_files);
     if ~found
-        fprintf('  -> %-4s skipped: no input file found.\n', upper(method_name));
+        fprintf('  -> %-10s skipped: no input file found.\n', upper(method_name));
         continue;
     end
 
-    fprintf('  -> %-4s loading: %s\n', upper(method_name), method_file);
-    raw_stack = loadMethodStack(method_file, method_name);
+    fprintf('  -> %-10s loading: %s\n', upper(method_name), method_file);
+    try
+        raw_stack = loadMethodStack(method_file, method_name);
+    catch ME
+        fprintf('     skipped: %s\n', ME.message);
+        continue;
+    end
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
 
     [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, method_name);
@@ -628,6 +673,20 @@ end
 
 function stack = loadMethodStack(mat_path, method_name)
     s = load(mat_path);
+    aliases = methodAliases(method_name);
+
+    % Aggregate files can contain several methods. Prefer a stack whose
+    % variable path explicitly names the requested method.
+    [stack, source_path] = findNamedStack(s, aliases, '');
+    if ~isempty(stack)
+        fprintf('     method stack found at variable path: %s\n', source_path);
+        return;
+    end
+
+    if strcmp(fileNameOnly(mat_path), 'data-conference-paper.mat')
+        error('Method "%s" was not found as a named field/path in %s.', method_name, mat_path);
+    end
+
     preferred = {'ph_stack', 'stack', 'data', 'phase_stack', method_name};
     for i = 1:numel(preferred)
         if isfield(s, preferred{i})
@@ -647,6 +706,98 @@ function stack = loadMethodStack(mat_path, method_name)
     end
 
     error('No usable 18-layer numeric stack found in %s', mat_path);
+end
+
+function name = fileNameOnly(path_name)
+    [~, stem, ext] = fileparts(path_name);
+    name = [stem, ext];
+end
+
+function aliases = methodAliases(method_name)
+    switch lower(method_name)
+        case 'tomo'
+            aliases = {'tomo', 'tomography'};
+        case 'dhm'
+            aliases = {'dhm', 'digitalholography', 'digital_holography'};
+        case 'fpm'
+            aliases = {'fpm', 'fourierptychography', 'fourier_ptychography'};
+        case 'tie'
+            aliases = {'tie'};
+        case 'dpc'
+            aliases = {'dpc'};
+        otherwise
+            aliases = {lower(method_name)};
+    end
+end
+
+function [stack, source_path] = findNamedStack(v, aliases, current_path)
+    stack = [];
+    source_path = '';
+
+    if isNamedStackCandidate(v, aliases, current_path)
+        stack = unwrapStackVariable(v);
+        if ~isempty(stack)
+            source_path = current_path;
+            return;
+        end
+    end
+
+    if isstruct(v)
+        names = fieldnames(v);
+
+        % First inspect fields whose names directly match the method. This
+        % prevents an aggregate file from returning another method's stack.
+        for pass = 1:2
+            for i = 1:numel(names)
+                field_path = appendPath(current_path, names{i});
+                field_matches = nameMatchesMethod(names{i}, aliases);
+                if (pass == 1 && ~field_matches) || (pass == 2 && field_matches)
+                    continue;
+                end
+
+                [stack, source_path] = findNamedStack(v.(names{i}), aliases, field_path);
+                if ~isempty(stack)
+                    return;
+                end
+            end
+        end
+    elseif iscell(v)
+        for i = 1:numel(v)
+            item_path = sprintf('%s{%d}', current_path, i);
+            [stack, source_path] = findNamedStack(v{i}, aliases, item_path);
+            if ~isempty(stack)
+                return;
+            end
+        end
+    end
+end
+
+function tf = isNamedStackCandidate(v, aliases, current_path)
+    tf = ~isempty(current_path) && nameMatchesMethod(current_path, aliases) && ...
+        ((isnumeric(v) && ndims(v) == 3 && any(size(v) == 18)) || isstruct(v) || iscell(v));
+end
+
+function tf = nameMatchesMethod(name, aliases)
+    normalized_name = normalizeName(name);
+    tf = false;
+    for i = 1:numel(aliases)
+        if contains(normalized_name, normalizeName(aliases{i}))
+            tf = true;
+            return;
+        end
+    end
+end
+
+function out = normalizeName(in)
+    out = lower(regexprep(char(in), '[^a-zA-Z0-9]', ''));
+end
+
+function out = appendPath(base_path, field_name)
+    if isempty(base_path)
+        out = field_name;
+    else
+        out = sprintf('%s.%s', base_path, field_name);
+    end
 end
 
 function stack = unwrapStackVariable(v)
@@ -672,6 +823,15 @@ function stack = unwrapStackVariable(v)
         end
         for i = 1:numel(names)
             stack = unwrapStackVariable(v.(names{i}));
+            if ~isempty(stack)
+                return;
+            end
+        end
+    end
+
+    if iscell(v)
+        for i = 1:numel(v)
+            stack = unwrapStackVariable(v{i});
             if ~isempty(stack)
                 return;
             end
