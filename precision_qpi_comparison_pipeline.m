@@ -60,7 +60,9 @@ cfg.gt_threshold = 0.05;
 cfg.min_cell_area = 5000;
 cfg.score_size = [128, 128];       % Downsampled size for fast all-pair scoring.
 cfg.assignment_margin = 35;        % Full-resolution local shift search, pixels.
-cfg.keep_only_gt_mask = true;      % Zero background outside the matched GT cell.
+cfg.keep_only_gt_mask = false;     % Preserve measured cell support; OVD uses an evaluation mask.
+cfg.output_mask_dilate_px = 8;     % Used only if keep_only_gt_mask is set to true.
+cfg.ovd_mask_dilate_px = 8;        % Prevent strict GT masks from clipping method cells.
 cfg.background_percentile = 5;     % Robust background subtraction percentile.
 
 % DPC raw phase-map extraction. If raw maps are available, this produces a
@@ -174,6 +176,12 @@ fprintf('\n================ Phase 3: Match methods to canonical GT =============
 aligned = struct();
 aligned.gt = gt;
 method_report = struct([]);
+shared_source_map = loadConferenceTruthSourceMap(cfg, gt);
+shared_source_map_source = '';
+if ~isempty(shared_source_map)
+    shared_source_map_source = 'model_synt';
+    fprintf('  -> Shared 45-to-18 source map initialized from model_synt.\n');
+end
 
 for m = 1:numel(method_specs)
     method_name = method_specs(m).name;
@@ -192,8 +200,19 @@ for m = 1:numel(method_specs)
     end
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
     method_params = fillMissingMethodParams(method_params, gt.physical_params);
+    raw_stack = rescaleStackToGtPixel(raw_stack, method_params, gt.physical_params);
 
-    [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, method_name);
+    if usesSharedSourceMap(method_name) && ~isempty(shared_source_map) && max(shared_source_map) <= size(raw_stack, 3)
+        [ordered_stack, report] = alignStackWithSourceMap(raw_stack, gt, cfg, method_name, shared_source_map);
+        report.shared_map_source = shared_source_map_source;
+    else
+        [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, method_name);
+        if isTomoAnchorMethod(method_name)
+            shared_source_map = report.selected_source_frames;
+            shared_source_map_source = method_name;
+            fprintf('     -> Shared source map updated from TOMO matching.\n');
+        end
+    end
     aligned.(method_name).ph_stack = ordered_stack;
     aligned.(method_name).source_file = method_file;
     aligned.(method_name).assignment = report.assignment;
@@ -216,6 +235,7 @@ save(fullfile(cfg.output_dir, 'all_methods_aligned_to_gt_401x401x18.mat'), ...
     'aligned', 'method_report', 'ovd_report', '-v7.3');
 save(fullfile(cfg.output_dir, 'ovd_comparison_report.mat'), 'ovd_report');
 writeOvdCsv(ovd_report, fullfile(cfg.output_dir, 'ovd_comparison_report.csv'));
+makeOvdPlots(ovd_report, cfg);
 
 %% -------------------- Visual verification --------------------------------
 fprintf('\n================ Phase 4: Verification gallery =====================\n');
@@ -299,6 +319,41 @@ function params = loadGtPhysicalParams(cfg)
         end
     end
     params.delta_n = params.polymerRI - params.n_immersion;
+end
+
+function source_map = loadConferenceTruthSourceMap(cfg, gt)
+    source_map = [];
+    if ~isfile(cfg.conference_data_file)
+        return;
+    end
+
+    try
+        s = load(cfg.conference_data_file);
+        if ~isfield(s, 'model_synt')
+            return;
+        end
+        model_stack = unwrapStackVariable(s.model_synt);
+        if isempty(model_stack) || size(model_stack, 3) < 18
+            return;
+        end
+        model_stack = standardizeStackSize(model_stack, cfg.patch_size);
+        source_patches = buildCandidatePatchStack(model_stack, cfg);
+        score_matrix = computeScoreMatrix(source_patches, gt, cfg);
+        source_map = exactMaxAssignment(score_matrix);
+    catch ME
+        fprintf('  -> model_synt source map skipped: %s\n', ME.message);
+        source_map = [];
+    end
+end
+
+function tf = isTomoAnchorMethod(method_name)
+    tf = strcmpi(method_name, 'tomo');
+end
+
+function tf = usesSharedSourceMap(method_name)
+    lower_name = lower(method_name);
+    tf = strcmp(lower_name, 'tomo') || ~isempty(strfind(lower_name, 'dhm')) || ...
+        ~isempty(strfind(lower_name, 'fpm'));
 end
 
 function height_map = loadHeightMap(mat_path)
@@ -989,46 +1044,137 @@ function stack = standardizeStackSize(stack, patch_size)
     if size(stack, 3) < 18
         error('Expected at least 18 sub-cell layers, got %d.', size(stack, 3));
     end
+end
 
-    if size(stack, 1) == patch_size(1) && size(stack, 2) == patch_size(2)
+function stack = rescaleStackToGtPixel(stack, method_params, gt_params)
+    if ~isfield(method_params, 'dx') || ~isfinite(method_params.dx) || ...
+            ~isfield(gt_params, 'dx') || ~isfinite(gt_params.dx) || gt_params.dx <= 0
         return;
     end
 
-    out = zeros(patch_size(1), patch_size(2), size(stack, 3));
-    for k = 1:size(stack, 3)
-        out(:, :, k) = imresize(double(stack(:, :, k)), patch_size, 'bilinear');
+    scale_factor = method_params.dx / gt_params.dx;
+    if ~isfinite(scale_factor) || scale_factor <= 0 || abs(scale_factor - 1) < 1e-3
+        return;
+    end
+
+    first = imresize(double(stack(:, :, 1)), scale_factor, 'bilinear');
+    out = zeros(size(first, 1), size(first, 2), size(stack, 3));
+    out(:, :, 1) = first;
+    for k = 2:size(stack, 3)
+        out(:, :, k) = imresize(double(stack(:, :, k)), scale_factor, 'bilinear');
     end
     stack = out;
 end
 
 function [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, method_name)
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
-    score_matrix = computeScoreMatrix(raw_stack, gt, cfg);
+    source_patches = buildCandidatePatchStack(raw_stack, cfg);
+    score_matrix = computeScoreMatrix(source_patches, gt, cfg);
     source_for_target = exactMaxAssignment(score_matrix);
 
-    ordered_stack = zeros(size(gt.stack));
-    local_shifts = zeros(18, 2);
-    pair_scores = zeros(18, 1);
+    [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames( ...
+        source_patches, source_for_target, score_matrix, gt, cfg);
 
-    for dst = 1:18
+    report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts);
+    printAssignmentReport(method_name, report, gt);
+end
+
+function [ordered_stack, report] = alignStackWithSourceMap(raw_stack, gt, cfg, method_name, source_for_target)
+    raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
+    source_patches = buildCandidatePatchStack(raw_stack, cfg);
+    if max(source_for_target) > size(source_patches, 3)
+        error('Shared source map references frame %d, but %s has only %d frames.', ...
+            max(source_for_target), method_name, size(source_patches, 3));
+    end
+
+    score_matrix = computeScoreMatrix(source_patches, gt, cfg);
+    [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames( ...
+        source_patches, source_for_target, score_matrix, gt, cfg);
+
+    report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts);
+    report.used_shared_source_map = true;
+    printAssignmentReport(method_name, report, gt);
+end
+
+function [ordered_stack, local_shifts, pair_scores] = alignSelectedSourceFrames(source_patches, source_for_target, score_matrix, gt, cfg)
+    n_target = size(gt.stack, 3);
+    ordered_stack = zeros(size(gt.stack));
+    local_shifts = zeros(n_target, 2);
+    pair_scores = zeros(n_target, 1);
+
+    for dst = 1:n_target
         src = source_for_target(dst);
-        mask = gt.mask_stack(:, :, dst);
-        [aligned_patch, shift_yx] = localRegisterPatch(raw_stack(:, :, src), gt.stack(:, :, dst), ...
+        mask = expandedMask(gt.mask_stack(:, :, dst), cfg.output_mask_dilate_px);
+        [aligned_patch, shift_yx] = localRegisterPatch(source_patches(:, :, src), gt.stack(:, :, dst), ...
             mask, cfg.assignment_margin);
         ordered_stack(:, :, dst) = cleanWithMask(aligned_patch, mask, cfg);
         local_shifts(dst, :) = shift_yx;
         pair_scores(dst) = score_matrix(src, dst);
     end
+end
 
+function report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts)
     report = struct();
     report.method = method_name;
-    report.assignment = [source_for_target(:), (1:18)'];
+    report.assignment = [source_for_target(:), (1:numel(source_for_target))'];
     report.score_matrix = score_matrix;
     report.pair_scores = pair_scores;
     report.local_shifts = local_shifts;
     report.selected_source_frames = source_for_target(:)';
+    report.used_shared_source_map = false;
+    report.shared_map_source = '';
+end
 
-    printAssignmentReport(method_name, report, gt);
+function source_patches = buildCandidatePatchStack(raw_stack, cfg)
+    H = cfg.patch_size(1);
+    W = cfg.patch_size(2);
+    n_source = size(raw_stack, 3);
+    source_patches = zeros(H, W, n_source);
+    for k = 1:n_source
+        source_patches(:, :, k) = extractCandidatePatch(raw_stack(:, :, k), cfg.patch_size);
+    end
+end
+
+function patch = extractCandidatePatch(img, patch_size)
+    H = patch_size(1);
+    W = patch_size(2);
+    img = double(img);
+    img(~isfinite(img)) = 0;
+
+    if size(img, 1) == H && size(img, 2) == W
+        patch = img;
+        return;
+    end
+
+    [cy, cx] = estimateCellCenter(img);
+    patch = cropCenteredWithPadding(img, cy, cx, H, W, median(img(:)));
+end
+
+function [cy, cx] = estimateCellCenter(img)
+    bg = median(img(:));
+    signal = abs(img - bg);
+    finite_signal = signal(isfinite(signal));
+    if isempty(finite_signal) || max(finite_signal) <= 0
+        cy = (size(img, 1) + 1) / 2;
+        cx = (size(img, 2) + 1) / 2;
+        return;
+    end
+
+    thresh = max(prctile(finite_signal, 92) * 0.35, max(finite_signal) * 0.08);
+    bw = signal > thresh;
+    if any(bw(:))
+        bw = bwareafilt(bw, 1);
+        props = regionprops(bw, 'Centroid', 'Area');
+        if ~isempty(props)
+            [~, idx] = max([props.Area]);
+            cx = props(idx).Centroid(1);
+            cy = props(idx).Centroid(2);
+            return;
+        end
+    end
+
+    [~, imax] = max(signal(:));
+    [cy, cx] = ind2sub(size(signal), imax);
 end
 
 function score_matrix = computeScoreMatrix(raw_stack, gt, cfg)
@@ -1042,17 +1188,22 @@ function score_matrix = computeScoreMatrix(raw_stack, gt, cfg)
     area_scale = safeMedianPositive(source_desc.area) / max(safeMedianPositive(target_desc.area), eps);
 
     source_feat = cell(n_source, 1);
+    source_shape = cell(n_source, 1);
     target_feat = cell(n_target, 1);
+    target_shape = cell(n_target, 1);
     for i = 1:n_source
         source_feat{i} = makeScoreFeature(raw_stack(:, :, i), cfg.score_size);
+        source_shape{i} = makeShapeFeature(raw_stack(:, :, i), cfg.score_size);
     end
     for i = 1:n_target
         target_feat{i} = makeScoreFeature(gt.stack(:, :, i), cfg.score_size);
+        target_shape{i} = makeShapeFeature(gt.stack(:, :, i), cfg.score_size);
     end
 
     for src = 1:n_source
         for dst = 1:n_target
             ncc_score = localNccScore(source_feat{src}, target_feat{dst}, 8);
+            shape_score = localNccScore(source_shape{src}, target_shape{dst}, 8);
 
             predicted_amp = target_desc.amp(dst) * amp_scale;
             amp_score = exp(-abs(log((source_desc.amp(src) + eps) / (predicted_amp + eps))) / 0.55);
@@ -1060,7 +1211,8 @@ function score_matrix = computeScoreMatrix(raw_stack, gt, cfg)
             predicted_area = target_desc.area(dst) * area_scale;
             area_score = exp(-abs(log((source_desc.area(src) + eps) / (predicted_area + eps))) / 0.80);
 
-            score_matrix(src, dst) = 0.72 * ncc_score + 0.22 * amp_score + 0.06 * area_score;
+            score_matrix(src, dst) = 0.42 * ncc_score + 0.40 * shape_score + ...
+                0.12 * amp_score + 0.06 * area_score;
         end
     end
 end
@@ -1096,6 +1248,30 @@ function feat = makeScoreFeature(patch, score_size)
     end
     feat = imresize(patch, score_size, 'bilinear');
     feat = normalizeForNcc(feat);
+end
+
+function feat = makeShapeFeature(patch, score_size)
+    patch = double(patch);
+    mask = adaptiveCellMask(patch);
+    feat = imresize(double(mask), score_size, 'bilinear');
+    feat = normalizeForNcc(feat);
+end
+
+function mask = adaptiveCellMask(patch)
+    patch = double(patch);
+    patch(~isfinite(patch)) = 0;
+    bg = median(patch(:));
+    signal = abs(patch - bg);
+    max_signal = max(signal(:));
+    if max_signal <= 0
+        mask = false(size(patch));
+        return;
+    end
+    thresh = max(prctile(signal(:), 88) * 0.40, max_signal * 0.06);
+    mask = signal > thresh;
+    if any(mask(:))
+        mask = bwareafilt(mask, 1);
+    end
 end
 
 function score = localNccScore(source_feat, target_feat, margin)
@@ -1241,9 +1417,23 @@ function patch = cleanWithMask(patch, mask, cfg)
     patch = double(patch);
     mask = logical(mask);
     if cfg.keep_only_gt_mask
-        patch(~mask) = 0;
+        mask_out = expandedMask(mask, cfg.output_mask_dilate_px);
+        patch(~mask_out) = 0;
     end
     patch = robustZeroPatch(patch, mask, cfg.background_percentile);
+end
+
+function mask_out = expandedMask(mask, radius_px)
+    mask_out = logical(mask);
+    if nargin < 2 || radius_px <= 0 || ~any(mask_out(:))
+        return;
+    end
+    if exist('strel', 'file') == 2 && exist('imdilate', 'file') == 2
+        mask_out = imdilate(mask_out, strel('disk', radius_px));
+    else
+        kernel = true(2 * radius_px + 1);
+        mask_out = conv2(double(mask_out), double(kernel), 'same') > 0;
+    end
 end
 
 function patch = robustZeroPatch(patch, mask, pct)
@@ -1309,7 +1499,7 @@ function ovd_report = computeOvdReport(aligned, method_specs, cfg)
     gt_ovd = zeros(n_cells, 1);
     gt_volume = zeros(n_cells, 1);
     for c = 1:n_cells
-        mask = gt.mask_stack(:, :, c);
+        mask = expandedMask(gt.mask_stack(:, :, c), cfg.ovd_mask_dilate_px);
         gt_ovd(c) = phaseToOvd(gt.stack(:, :, c), mask, gt_params.lambda, pixel_area_um2);
         gt_volume(c) = gt_ovd(c) / gt_params.delta_n;
     end
@@ -1325,7 +1515,7 @@ function ovd_report = computeOvdReport(aligned, method_specs, cfg)
         params = aligned.(method_name).method_params;
         for c = 1:n_cells
             row = row + 1;
-            mask = gt.mask_stack(:, :, c);
+            mask = expandedMask(gt.mask_stack(:, :, c), cfg.ovd_mask_dilate_px);
             method_ovd = phaseToOvd(aligned.(method_name).ph_stack(:, :, c), ...
                 mask, params.lambda, pixel_area_um2);
             method_volume = method_ovd / params.delta_n;
@@ -1370,6 +1560,92 @@ function writeOvdCsv(ovd_report, out_path)
     end
     T = struct2table(ovd_report);
     writetable(T, out_path);
+end
+
+function makeOvdPlots(ovd_report, cfg)
+    if isempty(ovd_report)
+        fprintf('  -> OVD plots skipped: empty report.\n');
+        return;
+    end
+
+    methods = unique({ovd_report.method}, 'stable');
+    cells = unique([ovd_report.cell_index]);
+    err_matrix = NaN(numel(methods), numel(cells));
+    for i = 1:numel(ovd_report)
+        m_idx = find(strcmp(methods, ovd_report(i).method), 1);
+        c_idx = find(cells == ovd_report(i).cell_index, 1);
+        err_matrix(m_idx, c_idx) = ovd_report(i).ovd_relative_error * 100;
+    end
+
+    fig_line = figure('Name', 'OVD Relative Error Lines', 'Color', 'w', 'Position', [100 100 1200 520]);
+    hold on; grid on; box on;
+    plot([1, numel(cells)], [0, 0], 'k-', 'LineWidth', 1.2, 'HandleVisibility', 'off');
+    for m = 1:numel(methods)
+        plot(1:numel(cells), err_matrix(m, :), '-o', 'LineWidth', 1.6, ...
+            'MarkerSize', 5, 'DisplayName', upper(methods{m}));
+    end
+    cell_labels = arrayfun(@(c) sprintf('C%d', c), cells, 'UniformOutput', false);
+    set(gca, 'XTick', 1:numel(cells), 'XTickLabel', cell_labels, 'XTickLabelRotation', 45);
+    ylabel('OVD relative error [%]', 'FontWeight', 'bold');
+    title('OVD Relative Error by Cell', 'FontWeight', 'bold');
+    legend('Location', 'eastoutside', 'Interpreter', 'none');
+    saveas(fig_line, fullfile(cfg.output_dir, 'ovd_relative_error_lines.png'));
+    close(fig_line);
+
+    fig_box = figure('Name', 'OVD Relative Error Boxplot', 'Color', 'w', 'Position', [150 150 1000 520]);
+    valid_vals = [];
+    valid_groups = {};
+    for m = 1:numel(methods)
+        vals = err_matrix(m, :);
+        vals = vals(isfinite(vals));
+        valid_vals = [valid_vals, vals]; %#ok<AGROW>
+        valid_groups = [valid_groups, repmat(methods(m), 1, numel(vals))]; %#ok<AGROW>
+    end
+    if ~isempty(valid_vals) && exist('boxplot', 'file') == 2
+        boxplot(valid_vals, valid_groups, 'LabelOrientation', 'inline');
+        grid on; box on;
+    else
+        hold on; grid on; box on;
+        for m = 1:numel(methods)
+            scatter(m * ones(1, size(err_matrix, 2)), err_matrix(m, :), 30, 'filled');
+        end
+        set(gca, 'XTick', 1:numel(methods), 'XTickLabel', upper(methods), 'XTickLabelRotation', 45);
+    end
+    ylabel('OVD relative error [%]', 'FontWeight', 'bold');
+    title('OVD Relative Error Distribution', 'FontWeight', 'bold');
+    saveas(fig_box, fullfile(cfg.output_dir, 'ovd_relative_error_boxplot.png'));
+    close(fig_box);
+
+    mean_err = NaN(1, numel(methods));
+    for m = 1:numel(methods)
+        vals = err_matrix(m, :);
+        mean_err(m) = mean(vals(isfinite(vals)));
+    end
+    fig_bar = figure('Name', 'Mean OVD Relative Error', 'Color', 'w', 'Position', [200 200 1000 520]);
+    bar(mean_err, 'FaceColor', [0.2 0.45 0.8], 'EdgeColor', 'k');
+    grid on; box on;
+    hold on;
+    plot(xlim, [0, 0], 'k-', 'LineWidth', 1.2);
+    set(gca, 'XTick', 1:numel(methods), 'XTickLabel', upper(methods), 'XTickLabelRotation', 45);
+    ylabel('Mean OVD relative error [%]', 'FontWeight', 'bold');
+    title('Mean OVD Relative Error by Method', 'FontWeight', 'bold');
+    for m = 1:numel(methods)
+        if isfinite(mean_err(m))
+            text(m, mean_err(m), sprintf(' %.2f%%', mean_err(m)), ...
+                'HorizontalAlignment', 'center', 'VerticalAlignment', valueLabelAlignment(mean_err(m)), ...
+                'FontWeight', 'bold');
+        end
+    end
+    saveas(fig_bar, fullfile(cfg.output_dir, 'ovd_mean_relative_error_bar.png'));
+    close(fig_bar);
+end
+
+function align = valueLabelAlignment(value)
+    if value >= 0
+        align = 'bottom';
+    else
+        align = 'top';
+    end
 end
 
 function makeVerificationGallery(aligned, method_specs, cfg)
