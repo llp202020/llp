@@ -66,6 +66,13 @@ cfg.ovd_mask_dilate_px = 0;        % OVD is integrated only over the cell itself
 cfg.background_percentile = 5;     % Robust background subtraction percentile.
 cfg.structured_group_size = 9;     % 45-frame conference stacks are 5 groups x 9 shapes.
 
+% TOMO-confirmed correspondence for the two OVD groups. Once TOMO has found
+% these indices, DHM/FPM/FHPM must use the exact same source frames.
+%   GT  1:9  (6000nm)  <- source 10:18
+%   GT 10:18 (15000nm) <- source 28:36
+% Set to [] only if you want to re-run automatic source-map discovery.
+cfg.tomo_confirmed_source_map = [10:18, 28:36];
+
 % DPC raw phase-map extraction. If raw maps are available, this produces a
 % fresh DPC stack; otherwise the script falls back to an existing DPC stack.
 cfg.run_dpc_raw_extraction_if_available = true;
@@ -177,11 +184,17 @@ fprintf('\n================ Phase 3: Match methods to canonical GT =============
 aligned = struct();
 aligned.gt = gt;
 method_report = struct([]);
-shared_source_map = loadConferenceTruthSourceMap(cfg, gt);
-shared_source_map_source = '';
+shared_source_map = cfg.tomo_confirmed_source_map;
+shared_source_map_source = 'tomo_confirmed';
 if ~isempty(shared_source_map)
-    shared_source_map_source = 'model_synt';
-    fprintf('  -> Shared 45-to-18 source map initialized from model_synt.\n');
+    fprintf('  -> Shared 45-to-18 source map fixed from TOMO-confirmed indices.\n');
+else
+    shared_source_map = loadConferenceTruthSourceMap(cfg, gt);
+    shared_source_map_source = '';
+    if ~isempty(shared_source_map)
+        shared_source_map_source = 'model_synt';
+        fprintf('  -> Shared 45-to-18 source map initialized from model_synt.\n');
+    end
 end
 
 for m = 1:numel(method_specs)
