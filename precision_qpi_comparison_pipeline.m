@@ -62,7 +62,7 @@ cfg.score_size = [128, 128];       % Downsampled size for fast all-pair scoring.
 cfg.assignment_margin = 35;        % Full-resolution local shift search, pixels.
 cfg.keep_only_gt_mask = false;     % Preserve measured cell support; OVD uses an evaluation mask.
 cfg.output_mask_dilate_px = 8;     % Used only if keep_only_gt_mask is set to true.
-cfg.ovd_mask_dilate_px = 8;        % Prevent strict GT masks from clipping method cells.
+cfg.ovd_mask_dilate_px = 0;        % OVD is integrated only over the cell itself.
 cfg.background_percentile = 5;     % Robust background subtraction percentile.
 cfg.structured_group_size = 9;     % 45-frame conference stacks are 5 groups x 9 shapes.
 
@@ -201,10 +201,16 @@ for m = 1:numel(method_specs)
     end
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
     method_params = fillMissingMethodParams(method_params, gt.physical_params);
-    raw_stack = rescaleStackToGtPixel(raw_stack, method_params, gt.physical_params);
+    if isTomoAnchorMethod(method_name)
+        raw_stack = rescaleStackToGtPixel(raw_stack, method_params, gt.physical_params);
+    end
 
     if usesSharedSourceMap(method_name) && ~isempty(shared_source_map) && max(shared_source_map) <= size(raw_stack, 3)
-        [ordered_stack, report] = alignStackWithSourceMap(raw_stack, gt, cfg, method_name, shared_source_map);
+        if isTomoAnchorMethod(method_name)
+            [ordered_stack, report] = alignTomoStackWithSourceMap(raw_stack, gt, cfg, method_name, shared_source_map);
+        else
+            [ordered_stack, report] = directStackWithSourceMap(raw_stack, gt, cfg, method_name, shared_source_map);
+        end
         report.shared_map_source = shared_source_map_source;
     else
         [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, method_name);
@@ -385,8 +391,7 @@ function source_map = structuredGroupSourceMap(source_stack, gt, cfg)
             sub_gt.mask_stack = gt.mask_stack(:, :, gt_idx);
 
             score = computeScoreMatrix(group_stack, sub_gt, cfg);
-            local_source_for_target = exactMaxAssignment(score);
-            mapped_frames = frame_idx(local_source_for_target);
+            mapped_frames = frame_idx;
 
             ratios = source_desc.amp(mapped_frames) ./ max(gt_desc.amp(gt_idx), eps);
             ratios = ratios(isfinite(ratios) & ratios > 0);
@@ -399,7 +404,7 @@ function source_map = structuredGroupSourceMap(source_stack, gt, cfg)
             end
 
             group_block(g, b).frames = mapped_frames;
-            group_block(g, b).score = median(diag(score(local_source_for_target, 1:numel(gt_idx))));
+            group_block(g, b).score = median(diag(score(1:group_size, 1:group_size)));
             group_block(g, b).amp_ratio = amp_ratio;
             group_block(g, b).amp_score = amp_score;
         end
@@ -419,8 +424,8 @@ function source_map = structuredGroupSourceMap(source_stack, gt, cfg)
             if isfinite(ratio6) && isfinite(ratio15) && ratio15 >= ratio6
                 amp_order_bonus = 0.15;
             end
-            score = group_block(g6, 1).score + group_block(g15, 2).score + ...
-                0.75 * group_block(g6, 1).amp_score + 0.75 * group_block(g15, 2).amp_score + ...
+            score = 0.25 * group_block(g6, 1).score + 0.25 * group_block(g15, 2).score + ...
+                2.00 * group_block(g6, 1).amp_score + 2.00 * group_block(g15, 2).amp_score + ...
                 amp_order_bonus;
             if score > best_score
                 best_score = score;
@@ -1165,7 +1170,7 @@ function [ordered_stack, report] = matchAndRegisterStack(raw_stack, gt, cfg, met
     printAssignmentReport(method_name, report, gt);
 end
 
-function [ordered_stack, report] = alignStackWithSourceMap(raw_stack, gt, cfg, method_name, source_for_target)
+function [ordered_stack, report] = alignTomoStackWithSourceMap(raw_stack, gt, cfg, method_name, source_for_target)
     raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
     source_patches = buildCandidatePatchStack(raw_stack, cfg);
     if max(source_for_target) > size(raw_stack, 3)
@@ -1179,6 +1184,32 @@ function [ordered_stack, report] = alignStackWithSourceMap(raw_stack, gt, cfg, m
 
     report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts);
     report.used_shared_source_map = true;
+    printAssignmentReport(method_name, report, gt);
+end
+
+function [ordered_stack, report] = directStackWithSourceMap(raw_stack, gt, cfg, method_name, source_for_target)
+    raw_stack = standardizeStackSize(raw_stack, cfg.patch_size);
+    if max(source_for_target) > size(raw_stack, 3)
+        error('Shared source map references frame %d, but %s has only %d frames.', ...
+            max(source_for_target), method_name, size(raw_stack, 3));
+    end
+
+    source_patches = buildCandidatePatchStack(raw_stack, cfg);
+    score_matrix = computeScoreMatrix(source_patches, gt, cfg);
+    n_target = size(gt.stack, 3);
+    ordered_stack = zeros(size(gt.stack));
+    local_shifts = zeros(n_target, 2);
+    pair_scores = zeros(n_target, 1);
+
+    for dst = 1:n_target
+        src = source_for_target(dst);
+        ordered_stack(:, :, dst) = extractDirectCorrespondingPatch(raw_stack(:, :, src), cfg.patch_size);
+        pair_scores(dst) = score_matrix(src, dst);
+    end
+
+    report = buildAssignmentReport(method_name, source_for_target, score_matrix, pair_scores, local_shifts);
+    report.used_shared_source_map = true;
+    report.direct_model_synt_correspondence = true;
     printAssignmentReport(method_name, report, gt);
 end
 
@@ -1210,6 +1241,7 @@ function report = buildAssignmentReport(method_name, source_for_target, score_ma
     report.selected_source_frames = source_for_target(:)';
     report.used_shared_source_map = false;
     report.shared_map_source = '';
+    report.direct_model_synt_correspondence = false;
 end
 
 function source_patches = buildCandidatePatchStack(raw_stack, cfg)
@@ -1235,6 +1267,23 @@ function patch = extractCandidatePatch(img, patch_size)
 
     [cy, cx] = estimateCellCenter(img);
     patch = cropCenteredWithPadding(img, cy, cx, H, W, median(img(:)));
+end
+
+function patch = extractDirectCorrespondingPatch(img, patch_size)
+    H = patch_size(1);
+    W = patch_size(2);
+    img = double(img);
+    img(~isfinite(img)) = 0;
+
+    if size(img, 1) == H && size(img, 2) == W
+        patch = img;
+    elseif size(img, 1) > H && size(img, 2) > W
+        cy = (size(img, 1) + 1) / 2;
+        cx = (size(img, 2) + 1) / 2;
+        patch = cropCenteredWithPadding(img, cy, cx, H, W, median(img(:)));
+    else
+        patch = imresize(img, [H, W], 'bilinear');
+    end
 end
 
 function patch = extractTargetedCandidatePatch(img, target_patch, cfg)
@@ -1618,7 +1667,7 @@ function ovd_report = computeOvdReport(aligned, method_specs, cfg)
     gt_ovd = zeros(n_cells, 1);
     gt_volume = zeros(n_cells, 1);
     for c = 1:n_cells
-        mask = expandedMask(gt.mask_stack(:, :, c), cfg.ovd_mask_dilate_px);
+        mask = gt.mask_stack(:, :, c);
         gt_ovd(c) = phaseToOvd(gt.stack(:, :, c), mask, gt_params.lambda, pixel_area_um2);
         gt_volume(c) = gt_ovd(c) / gt_params.delta_n;
     end
@@ -1634,7 +1683,7 @@ function ovd_report = computeOvdReport(aligned, method_specs, cfg)
         params = aligned.(method_name).method_params;
         for c = 1:n_cells
             row = row + 1;
-            mask = expandedMask(gt.mask_stack(:, :, c), cfg.ovd_mask_dilate_px);
+            mask = gt.mask_stack(:, :, c);
             method_ovd = phaseToOvd(aligned.(method_name).ph_stack(:, :, c), ...
                 mask, params.lambda, pixel_area_um2);
             method_volume = method_ovd / params.delta_n;
